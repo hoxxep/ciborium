@@ -4,6 +4,9 @@ use super::*;
 
 use ciborium_io::{slice::SliceReader, Read};
 
+#[cfg(feature = "half")]
+use half::f16;
+
 /// An error that occurred while decoding
 #[derive(Clone, Debug)]
 pub enum Error<T> {
@@ -33,7 +36,8 @@ impl<T> From<T> for Error<T> {
 pub struct Decoder<R> {
     reader: R,
     offset: usize,
-    buffer: Option<Title>,
+    buffer: Option<(Header, usize)>,
+    last_header_len: usize,
 }
 
 impl<R: Read> From<R> for Decoder<R> {
@@ -43,6 +47,7 @@ impl<R: Read> From<R> for Decoder<R> {
             reader: value,
             offset: 0,
             buffer: None,
+            last_header_len: 0,
         }
     }
 }
@@ -61,55 +66,98 @@ impl<R: Read> Read for Decoder<R> {
 
 impl<R: Read> Decoder<R> {
     #[inline]
-    fn pull_title(&mut self) -> Result<Title, Error<R::Error>> {
-        if let Some(title) = self.buffer.take() {
-            self.offset += title.1.as_ref().len() + 1;
-            return Ok(title);
+    fn pull_header(&mut self) -> Result<Header, Error<R::Error>> {
+        if let Some((header, len)) = self.buffer.take() {
+            self.offset += len;
+            self.last_header_len = len;
+            return Ok(header);
         }
 
+        let offset = self.offset;
         let mut prefix = [0u8; 1];
         self.read_exact(&mut prefix[..])?;
 
-        let major = match prefix[0] >> 5 {
-            0 => Major::Positive,
-            1 => Major::Negative,
-            2 => Major::Bytes,
-            3 => Major::Text,
-            4 => Major::Array,
-            5 => Major::Map,
-            6 => Major::Tag,
-            7 => Major::Other,
-            _ => unreachable!(),
+        let major = prefix[0] >> 5;
+        let additional = prefix[0] & 0x1f;
+        let value = match additional {
+            value @ 0..=23 => Some(value.into()),
+            24 => {
+                let mut bytes = [0u8; 1];
+                self.read_exact(&mut bytes)?;
+                Some(u8::from_be_bytes(bytes).into())
+            }
+            25 => {
+                let mut bytes = [0u8; 2];
+                self.read_exact(&mut bytes)?;
+                Some(u16::from_be_bytes(bytes).into())
+            }
+            26 => {
+                let mut bytes = [0u8; 4];
+                self.read_exact(&mut bytes)?;
+                Some(u32::from_be_bytes(bytes).into())
+            }
+            27 => {
+                let mut bytes = [0u8; 8];
+                self.read_exact(&mut bytes)?;
+                Some(u64::from_be_bytes(bytes))
+            }
+            31 => None,
+            _ => return Err(Error::Syntax(offset)),
         };
 
-        let mut minor = match prefix[0] & 0b00011111 {
-            x if x < 24 => Minor::This(x),
-            24 => Minor::Next1([0; 1]),
-            25 => Minor::Next2([0; 2]),
-            26 => Minor::Next4([0; 4]),
-            27 => Minor::Next8([0; 8]),
-            31 => Minor::More,
-            _ => return Err(Error::Syntax(self.offset - 1)),
+        let header = match (major, additional, value) {
+            (0, _, Some(value)) => Header::Positive(value),
+            (1, _, Some(value)) => Header::Negative(value),
+            (2, _, value) => Header::Bytes(
+                value
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| Error::Syntax(offset))?,
+            ),
+            (3, _, value) => Header::Text(
+                value
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| Error::Syntax(offset))?,
+            ),
+            (4, _, value) => Header::Array(
+                value
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| Error::Syntax(offset))?,
+            ),
+            (5, _, value) => Header::Map(
+                value
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| Error::Syntax(offset))?,
+            ),
+            (6, _, Some(value)) => Header::Tag(value),
+
+            (7, 31, None) => Header::Break,
+            (7, 0..=24, Some(value)) => Header::Simple(value as u8),
+            (7, 25, Some(value)) => {
+                #[cfg(feature = "half")]
+                let value = f16::from_bits(value as u16);
+
+                #[cfg(not(feature = "half"))]
+                let value = f16::from_bits(value as u16);
+
+                Header::Float(value.into())
+            }
+            (7, 26, Some(value)) => Header::Float(f32::from_bits(value as u32).into()),
+            (7, 27, Some(value)) => Header::Float(f64::from_bits(value)),
+            _ => return Err(Error::Syntax(offset)),
         };
 
-        self.read_exact(minor.as_mut())?;
-        Ok(Title(major, minor))
-    }
-
-    #[inline]
-    fn push_title(&mut self, item: Title) {
-        assert!(self.buffer.is_none());
-        self.buffer = Some(item);
-        self.offset -= item.1.as_ref().len() + 1;
+        self.last_header_len = self.offset - offset;
+        Ok(header)
     }
 
     /// Pulls the next header from the input
     #[inline]
     pub fn pull(&mut self) -> Result<Header, Error<R::Error>> {
-        let offset = self.offset;
-        self.pull_title()?
-            .try_into()
-            .map_err(|_| Error::Syntax(offset))
+        self.pull_header()
     }
 
     /// Push a single header into the input buffer
@@ -121,7 +169,9 @@ impl<R: Read> Decoder<R> {
     /// pulling a header to ensure there is nothing in the input buffer.
     #[inline]
     pub fn push(&mut self, item: Header) {
-        self.push_title(Title::from(item))
+        assert!(self.buffer.is_none());
+        self.offset -= self.last_header_len;
+        self.buffer = Some((item, self.last_header_len));
     }
 
     /// Gets the current byte offset into the stream

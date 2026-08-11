@@ -4,6 +4,40 @@ use super::*;
 
 use ciborium_io::Write;
 
+#[cfg(feature = "half")]
+use half::f16;
+
+#[inline(always)]
+fn push_value<W: Write>(writer: &mut W, major: u8, value: u64) -> Result<(), W::Error> {
+    let prefix = major << 5;
+    match value {
+        0..=23 => writer.write_all(&[prefix | value as u8]),
+        24..=0xff => writer.write_all(&[prefix | 24, value as u8]),
+        0x100..=0xffff => {
+            let value = (value as u16).to_be_bytes();
+            writer.write_all(&[prefix | 25, value[0], value[1]])
+        }
+        0x1_0000..=0xffff_ffff => {
+            let value = (value as u32).to_be_bytes();
+            writer.write_all(&[prefix | 26, value[0], value[1], value[2], value[3]])
+        }
+        _ => {
+            let value = value.to_be_bytes();
+            writer.write_all(&[
+                prefix | 27,
+                value[0],
+                value[1],
+                value[2],
+                value[3],
+                value[4],
+                value[5],
+                value[6],
+                value[7],
+            ])
+        }
+    }
+}
+
 /// An encoder for serializing CBOR items
 ///
 /// This structure wraps a writer and provides convenience functions for
@@ -41,30 +75,48 @@ impl<W: Write> Encoder<W> {
     /// Push a `Header` to the wire
     #[inline(always)]
     pub fn push(&mut self, header: Header) -> Result<(), W::Error> {
-        let title = Title::from(header);
+        match header {
+            Header::Positive(value) => push_value(&mut self.0, 0, value),
+            Header::Negative(value) => push_value(&mut self.0, 1, value),
+            Header::Bytes(Some(value)) => push_value(&mut self.0, 2, value as u64),
+            Header::Text(Some(value)) => push_value(&mut self.0, 3, value as u64),
+            Header::Array(Some(value)) => push_value(&mut self.0, 4, value as u64),
+            Header::Map(Some(value)) => push_value(&mut self.0, 5, value as u64),
+            Header::Tag(value) => push_value(&mut self.0, 6, value),
 
-        let major = match title.0 {
-            Major::Positive => 0,
-            Major::Negative => 1,
-            Major::Bytes => 2,
-            Major::Text => 3,
-            Major::Array => 4,
-            Major::Map => 5,
-            Major::Tag => 6,
-            Major::Other => 7,
-        };
+            Header::Bytes(None) => self.0.write_all(&[0x5f]),
+            Header::Text(None) => self.0.write_all(&[0x7f]),
+            Header::Array(None) => self.0.write_all(&[0x9f]),
+            Header::Map(None) => self.0.write_all(&[0xbf]),
+            Header::Break => self.0.write_all(&[0xff]),
+            Header::Simple(value @ 0..=23) => self.0.write_all(&[0xe0 | value]),
+            Header::Simple(value) => self.0.write_all(&[0xf8, value]),
+            Header::Float(value) => {
+                #[cfg(feature = "half")]
+                let half = f16::from_f64(value);
 
-        let minor = match title.1 {
-            Minor::This(x) => x,
-            Minor::Next1(..) => 24,
-            Minor::Next2(..) => 25,
-            Minor::Next4(..) => 26,
-            Minor::Next8(..) => 27,
-            Minor::More => 31,
-        };
+                #[cfg(not(feature = "half"))]
+                let half = value as f16;
 
-        self.0.write_all(&[major << 5 | minor])?;
-        self.0.write_all(title.1.as_ref())
+                if f64::from(half).to_bits() == value.to_bits() {
+                    let half = half.to_be_bytes();
+                    self.0.write_all(&[0xf9, half[0], half[1]])
+                } else {
+                    let single = value as f32;
+                    if f64::from(single).to_bits() == value.to_bits() {
+                        let single = single.to_be_bytes();
+                        self.0
+                            .write_all(&[0xfa, single[0], single[1], single[2], single[3]])
+                    } else {
+                        let value = value.to_be_bytes();
+                        self.0.write_all(&[
+                            0xfb, value[0], value[1], value[2], value[3], value[4], value[5],
+                            value[6], value[7],
+                        ])
+                    }
+                }
+            }
+        }
     }
 
     /// Serialize a byte slice as CBOR
