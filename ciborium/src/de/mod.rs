@@ -428,9 +428,19 @@ where
     }
 
     fn deserialize_i64<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let result = match self.integer(None, false, noop)? {
-            (false, raw) => i64::try_from(raw),
-            (true, raw) => i64::try_from(raw).map(|x| x ^ !0),
+        let result = loop {
+            match self.decoder.pull()? {
+                Header::Positive(raw) => break i64::try_from(raw),
+                Header::Negative(raw) => break i64::try_from(raw).map(|x| x ^ !0),
+                header @ Header::Tag(tag::BIGPOS | tag::BIGNEG) => {
+                    break match self.integer(Some(header), false, noop)? {
+                        (false, raw) => i64::try_from(raw),
+                        (true, raw) => i64::try_from(raw).map(|x| x ^ !0),
+                    };
+                }
+                Header::Tag(..) => continue,
+                header => return Err(header.expected("integer")),
+            }
         };
 
         match result {
@@ -464,9 +474,23 @@ where
     }
 
     fn deserialize_u64<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let result = match self.integer(None, false, noop)? {
-            (false, raw) => u64::try_from(raw),
-            (true, ..) => return Err(de::Error::custom("unexpected negative integer")),
+        let result = loop {
+            match self.decoder.pull()? {
+                Header::Positive(raw) => break Ok(raw),
+                Header::Negative(..) | Header::Tag(tag::BIGNEG) => {
+                    return Err(de::Error::custom("unexpected negative integer"));
+                }
+                header @ Header::Tag(tag::BIGPOS) => {
+                    break match self.integer(Some(header), false, noop)? {
+                        (false, raw) => u64::try_from(raw),
+                        (true, ..) => {
+                            return Err(de::Error::custom("unexpected negative integer"));
+                        }
+                    };
+                }
+                Header::Tag(..) => continue,
+                header => return Err(header.expected("integer")),
+            }
         };
 
         match result {
