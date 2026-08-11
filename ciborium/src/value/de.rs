@@ -115,7 +115,7 @@ impl<'de> serde::de::Visitor<'de> for Visitor {
 
     #[inline]
     fn visit_seq<A: de::SeqAccess<'de>>(self, mut acc: A) -> Result<Self::Value, A::Error> {
-        let mut seq = Vec::with_capacity(acc.size_hint().filter(|&l| l < 1024).unwrap_or(0));
+        let mut seq = Vec::new();
 
         while let Some(elem) = acc.next_element()? {
             seq.push(elem);
